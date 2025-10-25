@@ -1,351 +1,3 @@
-# app.py — Marine Dive ROV Control via I2C (RPi master -> ESP32 slave @0x42)
-# - Управление: P1/P2 (помпы), M (ESC), R (руль), L (свет)
-# - I2C отправка команд через i2c_msg.write (без лишнего регистрового байта)
-# - Чтение короткого статуса (до 32 байт) от ESP32
-# - Видео (Picamera2 MJPEG), IMU (MPU6050), простые UI эндпоинты
-#
-# Endpoints (основные):
-#   /                  -> templates/index.html (оставь свой UI)
-#   /video_feed        -> MJPEG
-#   /snapshot          -> 1 кадр JPEG
-#   /control (POST)    -> {"M":..,"P1":..,"P2":..,"R":..,"L":0/1}
-#   /light_on /light_off
-#   /status            -> camera_ok + esp_status (строка ACK;...)
-#   /imu, /imu_raw
-
-import os
-import time
-import math
-import cv2
-from collections import deque
-from threading import Thread
-from flask import Flask, request, jsonify, Response, render_template
-
-# ===== I2C master (RPi) =====
-from smbus2 import SMBus, i2c_msg
-
-I2C_BUS_ID   = 1            # Raspberry Pi обычная шина = 1
-ESP_I2C_ADDR = 0x42         # адрес ESP32-slave
-I2C_RESP_N   = 32           # читаем до 32 байт статуса
-
-# Свет: на твоей плате активный HIGH (инверсия не нужна)
-LIGHT_INVERT = False
-
-# Видео
-VIDEO_WIDTH  = 320
-VIDEO_HEIGHT = 240
-VIDEO_FPS    = 15
-
-# IMU (MPU6050 на I2C)
-IMU_HZ = 50
-CF_ALPHA = 0.98
-DLPF_MODE = 6
-GYRO_SENS = 131.0
-ACCEL_SENS = 16384.0
-
-FLASK_PORT = 8000
-
-# ====== глобалы ======
-imu_data = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0, "ts": 0.0}
-imu_raw_buf = deque(maxlen=50)
-imu_lines = 0
-
-telemetry_data = {
-    "depth": 0.0,
-    "temperature": 20.5,
-    "voltage": 12.3,
-    "current": 1.2,
-    "heading": 0,
-    "pressure": 1013,
-}
-
-_last_light = {"on": False}
-
-# ====== I2C helpers (сырые записи!) ======
-def i2c_send_raw(cmd: str) -> bool:
-    """Отправить строку команд в ESP32 без 'регистрового' байта."""
-    try:
-        payload = bytes(cmd + "\n", "ascii")
-        with SMBus(I2C_BUS_ID) as bus:
-            msg = i2c_msg.write(ESP_I2C_ADDR, payload)
-            bus.i2c_rdwr(msg)
-        return True
-    except Exception as e:
-        print("i2c_send_raw error:", e)
-        return False
-
-def i2c_read_status(n: int = I2C_RESP_N) -> str:
-    """Прочитать короткий статус (до 32 байт)."""
-    try:
-        with SMBus(I2C_BUS_ID) as bus:
-            msg = i2c_msg.read(ESP_I2C_ADDR, n)
-            bus.i2c_rdwr(msg)
-            raw = bytes(msg)
-        s = raw.decode("utf-8", errors="ignore").strip("\x00\r\n ")
-        return s
-    except Exception as e:
-        print("i2c_read_status error:", e)
-        return ""
-
-def esp_cmd_and_status(cmd: str) -> str:
-    """Удобно: отправили команду, затем прочитали статус."""
-    ok = i2c_send_raw(cmd)
-    # Небольшая пауза, чтобы ESP обновил resp_buf
-    time.sleep(0.01)
-    return i2c_read_status() if ok else ""
-
-# ====== камера ======
-CAMERA_OK = False
-picam2 = None
-try:
-    from picamera2 import Picamera2
-    picam2 = Picamera2()
-    video_config = picam2.create_video_configuration(
-        main={"size": (VIDEO_WIDTH, VIDEO_HEIGHT), "format": "RGB888"},
-        buffer_count=3,
-    )
-    picam2.configure(video_config)
-    picam2.start()
-    time.sleep(0.3)
-    CAMERA_OK = True
-    print("🎥 Picamera2 started")
-except Exception as e:
-    print("❌ Camera init error:", e)
-    CAMERA_OK = False
-
-# ====== IMU MPU6050 (I2C на RPi) ======
-import smbus2
-REG_PWR_MGMT_1   = 0x6B
-REG_SMPLRT_DIV   = 0x19
-REG_CONFIG       = 0x1A
-REG_GYRO_CONFIG  = 0x1B
-REG_ACCEL_CONFIG = 0x1C
-REG_ACCEL_XOUT_H = 0x3B
-REG_WHO_AM_I     = 0x75
-
-gx_bias = gy_bias = gz_bias = 0.0
-
-def _i2c_write(bus, addr, reg, val): bus.write_byte_data(addr, reg, val)
-def _i2c_read_i16(bus, addr, reg):
-    hi = bus.read_byte_data(addr, reg)
-    lo = bus.read_byte_data(addr, reg + 1)
-    v = (hi << 8) | lo
-    return v - 65536 if v & 0x8000 else v
-
-def _mpu_detect_addr(bus):
-    for a in (0x68, 0x69):
-        try:
-            bus.read_byte_data(a, REG_WHO_AM_I)
-            return a
-        except Exception:
-            pass
-    return None
-
-def _mpu_init(bus, addr):
-    _i2c_write(bus, addr, REG_PWR_MGMT_1, 0x00)
-    time.sleep(0.05)
-    _i2c_write(bus, addr, REG_CONFIG, DLPF_MODE & 7)
-    _i2c_write(bus, addr, REG_GYRO_CONFIG, 0x00)
-    _i2c_write(bus, addr, REG_ACCEL_CONFIG, 0x00)
-    _i2c_write(bus, addr, REG_SMPLRT_DIV, 0x07)  # 125 Hz
-    time.sleep(0.05)
-
-def _mpu_read_all(bus, addr):
-    ax = _i2c_read_i16(bus, addr, REG_ACCEL_XOUT_H + 0)
-    ay = _i2c_read_i16(bus, addr, REG_ACCEL_XOUT_H + 2)
-    az = _i2c_read_i16(bus, addr, REG_ACCEL_XOUT_H + 4)
-    gx = _i2c_read_i16(bus, addr, 0x43)
-    gy = _i2c_read_i16(bus, addr, 0x45)
-    gz = _i2c_read_i16(bus, addr, 0x47)
-    return ax, ay, az, gx, gy, gz
-
-def _mpu_calibrate(bus, addr, samples=300):
-    global gx_bias, gy_bias, gz_bias
-    sx = sy = sz = 0
-    for _ in range(samples):
-        _, _, _, gx, gy, gz = _mpu_read_all(bus, addr)
-        sx += gx; sy += gy; sz += gz
-        time.sleep(0.002)
-    gx_bias = sx / samples
-    gy_bias = sy / samples
-    gz_bias = sz / samples
-    print(f"IMU gyro bias: {gx_bias:.1f}, {gy_bias:.1f}, {gz_bias:.1f}")
-
-def imu_thread_fn():
-    global imu_data, imu_lines
-    try:
-        bus = smbus2.SMBus(1)
-    except Exception as e:
-        print("❌ I2C bus error:", e)
-        return
-    TARGET_HZ = max(10, min(100, IMU_HZ))
-    period = 1.0 / TARGET_HZ
-    while True:
-        try:
-            addr = _mpu_detect_addr(bus)
-            if addr is None:
-                print("❌ MPU6050 not found at 0x68/0x69. Retrying…")
-                time.sleep(3.0)
-                continue
-            print(f"✅ MPU6050 at 0x{addr:02X}")
-            _mpu_init(bus, addr)
-            _mpu_calibrate(bus, addr, 300)
-            roll = pitch = yaw = 0.0
-            next_t = time.monotonic()
-            while True:
-                t0 = time.monotonic()
-                ax, ay, az, gx, gy, gz = _mpu_read_all(bus, addr)
-                ax_g = ax / ACCEL_SENS; ay_g = ay / ACCEL_SENS; az_g = az / ACCEL_SENS
-                gx_dps = (gx - gx_bias) / GYRO_SENS
-                gy_dps = (gy - gy_bias) / GYRO_SENS
-                gz_dps = (gz - gz_bias) / GYRO_SENS
-                dt = max(0.001, t0 - (next_t - period))
-                roll_acc  = math.degrees(math.atan2(ay_g, az_g))
-                pitch_acc = math.degrees(math.atan2(-ax_g, (ay_g*ay_g + az_g*az_g) ** 0.5))
-                roll  = CF_ALPHA * (roll  + gx_dps * dt) + (1 - CF_ALPHA) * roll_acc
-                pitch = CF_ALPHA * (pitch + gy_dps * dt) + (1 - CF_ALPHA) * pitch_acc
-                yaw  += gz_dps * dt
-                now = time.time()
-                imu_data.update({"roll": roll, "pitch": pitch, "yaw": yaw, "ts": now})
-                imu_raw_buf.append({"ax": ax, "ay": ay, "az": az, "gx": gx, "gy": gy, "gz": gz,
-                                    "roll": roll, "pitch": pitch, "yaw": yaw, "ts": now})
-                imu_lines += 1
-                next_t += period
-                time.sleep(max(0.0, next_t - time.monotonic()))
-        except Exception as e:
-            print("IMU thread error:", e)
-            time.sleep(3.0)
-
-# ====== Flask ======
-app = Flask(__name__, static_folder="static", template_folder="templates")
-
-def generate_frames():
-    if not CAMERA_OK or not picam2:
-        while True:
-            time.sleep(0.5)
-            yield (b'--FRAME\r\nContent-Type: image/jpeg\r\n\r\n\r\n')
-    else:
-        while True:
-            try:
-                frame = picam2.capture_array()
-                frame = cv2.rotate(frame, cv2.ROTATE_180)
-                ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                if not ok:
-                    time.sleep(0.05)
-                    continue
-                yield (b'--FRAME\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-                time.sleep(1 / max(1, VIDEO_FPS))
-            except Exception:
-                time.sleep(0.1)
-
-@app.route('/')
-def index():
-    # Оставь свой index.html из проекта (в папке templates)
-    return render_template('index.html')
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=FRAME')
-
-@app.route('/snapshot')
-def snapshot():
-    if not CAMERA_OK or not picam2:
-        return ("Camera not initialized", 503)
-    try:
-        frame = picam2.capture_array()
-        frame = cv2.rotate(frame, cv2.ROTATE_180)
-        ok, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if not ok:
-            return ("JPEG encode failed", 500)
-        return Response(buffer.tobytes(), mimetype="image/jpeg")
-    except Exception as e:
-        return (f"Snapshot error: {e}", 500)
-
-def send_controls(payload):
-    """Собираем строку команд и шлём в ESP по I2C, читаем статус."""
-    commands = []
-    if 'P1' in payload: commands.append(f"P1:{int(payload['P1'])}")
-    if 'P2' in payload: commands.append(f"P2:{int(payload['P2'])}")
-    if 'M'  in payload: commands.append(f"M:{int(payload['M'])}")
-    if 'R'  in payload: commands.append(f"R:{int(payload['R'])}")
-    if 'L'  in payload:
-        raw = 1 if int(payload['L']) else 0
-        val = (0 if raw == 1 else 1) if LIGHT_INVERT else raw
-        commands.append(f"L:{val}")
-        _last_light['on'] = (raw == 1)
-
-    if not commands:
-        return False, "no commands", ""
-
-    cmd = "|".join(commands)
-    status = esp_cmd_and_status(cmd)
-    return True, "", status
-
-@app.route('/control', methods=['POST'])
-def control():
-    try:
-        data = request.get_json(force=True, silent=False) or {}
-        ok, err, status = send_controls(data)
-        return jsonify({'status': 'OK' if ok else 'ERROR',
-                        'sent': data, 'esp_status': status, 'error': err})
-    except Exception as e:
-        return jsonify({'status': 'ERROR', 'message': str(e)}), 400
-
-@app.route('/light_on')
-def light_on():
-    raw = 1
-    val = (0 if raw == 1 else 1) if LIGHT_INVERT else raw
-    status = esp_cmd_and_status(f"L:{val}")
-    _last_light['on'] = True
-    return jsonify({"status": "OK", "esp_status": status})
-
-@app.route('/light_off')
-def light_off():
-    raw = 0
-    val = (0 if raw == 1 else 1) if LIGHT_INVERT else raw
-    status = esp_cmd_and_status(f"L:{val}")
-    _last_light['on'] = False
-    return jsonify({"status": "OK", "esp_status": status})
-
-@app.route('/api/light/get')
-def api_light_get():
-    return jsonify({"on": bool(_last_light.get("on", False))})
-
-@app.route('/status')
-def status():
-    s = i2c_read_status()
-    return jsonify({'status': 'running', 'esp_status': s, 'camera_ok': CAMERA_OK})
-
-@app.route('/imu')
-def imu():
-    return jsonify(imu_data)
-
-@app.route('/imu_raw')
-def imu_raw():
-    return jsonify({"count": imu_lines, "last": list(imu_raw_buf)})
-
-# ====== MAIN ======
-if __name__ == '__main__':
-    if not os.path.exists('templates/index.html'):
-        print("❌ templates/index.html not found!")
-        raise SystemExit(1)
-
-    print("=== Marine Dive ROV (I2C master) ===")
-    print(f"ESP I2C addr: 0x{ESP_I2C_ADDR:02X}  on bus {I2C_BUS_ID}")
-    print(f"UI: http://0.0.0.0:{FLASK_PORT}")
-
-    try:
-        Thread(target=imu_thread_fn, daemon=True).start()
-        app.run(host='0.0.0.0', port=FLASK_PORT, debug=False, threaded=True)
-    finally:
-        try:
-            if picam2:
-                picam2.stop()
-        except Exception:
-            pass
-trevor@raspberrypi:~/marine_dive $ cd templates/
-trevor@raspberrypi:~/marine_dive/templates $ cat index.html
 <!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -353,101 +5,41 @@ trevor@raspberrypi:~/marine_dive/templates $ cat index.html
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>Marine Dive ROV - Control Panel</title>
 <style>
-  :root{
-    --size: 280px;
-    --px-per-deg: 2.2;
-  }
+  :root{ --size: 280px; --px-per-deg: 2.2; }
   *{margin:0;padding:0;box-sizing:border-box}
-  body{
-    font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-    color:#fff; min-height:100vh;
-    background:#0c1e36 url("/static/bg.png") center/cover fixed no-repeat;
-  }
-  .container{
-    max-width:1200px;margin:0 auto;padding:20px;
-    display:grid;gap:20px;grid-template-columns: 1fr 1fr;
-  }
-  .header{
-    grid-column:1/-1;background:rgba(0,0,0,.35);
-    border:1px solid rgba(255,255,255,.15);border-radius:12px;
-    padding:16px;text-align:center
-  }
+  body{ font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; color:#fff;
+        min-height:100vh; background:#0c1e36 url("/static/bg.png") center/cover fixed no-repeat; }
+  .container{ max-width:1200px;margin:0 auto;padding:20px; display:grid;gap:20px;grid-template-columns: 1fr 1fr; }
+  .header{ grid-column:1/-1;background:rgba(0,0,0,.35); border:1px solid rgba(255,255,255,.15);border-radius:12px; padding:16px;text-align:center }
   .header h1{font-size:26px;margin-bottom:6px}
-  .header p{opacity:.9}
-  .card{
-    background:rgba(0,0,0,.30);border:1px solid rgba(255,255,255,.14);
-    border-radius:12px;padding:16px
-  }
+  .card{ background:rgba(0,0,0,.30);border:1px solid rgba(255,255,255,.14); border-radius:12px;padding:16px }
   h2{color:#8fd0ff;font-size:18px;margin-bottom:12px}
   .video-feed{width:100%;aspect-ratio:4/3;display:block;border-radius:8px;background:#000}
   .telemetry{display:grid;grid-template-columns: 1fr auto;gap:16px;align-items:start}
   .telemetry-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-  .telemetry-item{
-    background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);
-    border-radius:8px;padding:10px;text-align:center
-  }
+  .telemetry-item{ background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12); border-radius:8px;padding:10px;text-align:center }
   .telemetry-item .label{opacity:.8;font-size:13px;margin-bottom:6px}
-  .telemetry-item .value{font-size:18px}
   .control-panel{display:grid;grid-template-columns: repeat(4, 1fr); gap:15px}
-  .control-group{
-    background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);
-    border-radius:8px;padding:12px;text-align:center
-  }
+  .control-group{ background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12); border-radius:8px;padding:12px;text-align:center }
   .slider{width:100%}
   .value-display{margin-top:8px;opacity:.9}
   .button{background:#4CAF50;border:none;padding:10px 12px;border-radius:8px;color:#fff;cursor:pointer;margin-top:8px}
-
-  /* авиагоризонт */
-  .horizon{
-    width:var(--size);height:var(--size);border-radius:50%;
-    position:relative;overflow:hidden;background:#111;
-    box-shadow: inset 0 0 0 2px rgba(255,255,255,0.18), inset 0 0 24px rgba(0,0,0,0.6)
-  }
-  .sphere{position:absolute;inset:-240% -80%;
-    background:
-      linear-gradient(to bottom, #4aa3ff 0 50%, #7b4d1f 50% 100%),
-      repeating-linear-gradient(to bottom, rgba(255,255,255,0.10) 0 1px, transparent 1px 12px);
-    filter:saturate(1.05);
-  }
-  .bezel{position:absolute;inset:0;border-radius:50%;pointer-events:none;
-    box-shadow:inset 0 0 0 2px rgba(255,255,255,.25), inset 0 0 40px rgba(0,0,0,.6)}
+  /* horizon styles omitted for brevity (оставил как у тебя) */
+  .horizon{width:var(--size);height:var(--size);border-radius:50%;position:relative;overflow:hidden;background:#111;box-shadow: inset 0 0 0 2px rgba(255,255,255,0.18), inset 0 0 24px rgba(0,0,0,0.6)}
+  .sphere{position:absolute;inset:-240% -80%;background:linear-gradient(to bottom,#4aa3ff 0 50%,#7b4d1f 50% 100%),repeating-linear-gradient(to bottom,rgba(255,255,255,0.10) 0 1px,transparent 1px 12px);filter:saturate(1.05)}
+  .bezel{position:absolute;inset:0;border-radius:50%;pointer-events:none;box-shadow:inset 0 0 0 2px rgba(255,255,255,.25), inset 0 0 40px rgba(0,0,0,.6)}
   .roll-pointer{position:absolute;inset:0;pointer-events:none}
-  .roll-pointer::before{
-    content:"";position:absolute;left:50%;top:6px;transform:translateX(-50%);
-    width:0;height:0;border-left:7px solid transparent;border-right:7px solid transparent;
-    border-bottom:10px solid #fff;opacity:.95
-  }
-  .center-line{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
-    width:90px;height:2px;background:#fff;border-radius:1px}
+  .roll-pointer::before{content:"";position:absolute;left:50%;top:6px;transform:translateX(-50%);width:0;height:0;border-left:7px solid transparent;border-right:7px solid transparent;border-bottom:10px solid #fff;opacity:.95}
+  .center-line{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:90px;height:2px;background:#fff;border-radius:1px}
   .compass{position:absolute;inset:0;pointer-events:none;transform-origin:50% 50%;}
   .roll-scale{position:absolute;inset:0;border-radius:50%;}
-  .roll-tick{
-    position:absolute;left:50%;top:50%;transform-origin:50% 50%;
-    width:2px;height:9px;background:#fff;border-radius:2px;opacity:.9
-  }
+  .roll-tick{position:absolute;left:50%;top:50%;transform-origin:50% 50%;width:2px;height:9px;background:#fff;border-radius:2px;opacity:.9}
   .roll-tick.small{height:6px;opacity:.75}
-  .roll-label{
-    position:absolute;left:50%;top:50%;transform-origin:50% 50%;
-    font-size:10px;opacity:.95;white-space:nowrap;
-    background:rgba(0,0,0,.35);padding:1px 4px;border-radius:6px
-  }
+  .roll-label{position:absolute;left:50%;top:50%;transform-origin:50% 50%;font-size:10px;opacity:.95;white-space:nowrap;background:rgba(0,0,0,.35);padding:1px 4px;border-radius:6px}
   .pitch-ladder{position:absolute;inset:0;pointer-events:none}
-  .ladder-line{
-    position:absolute;left:50%;width:60px;height:2px;background:#fff;opacity:.95;border-radius:1px
-  }
-  .ladder-line .text{
-    position:absolute;top:-10px;left:-40px;font-size:10px;background:rgba(0,0,0,.4);
-    padding:0 3px;border-radius:4px
-  }
-
-  @media (max-width: 980px){
-    .container{grid-template-columns:1fr}
-    .telemetry{grid-template-columns: 1fr}
-    .horizon{margin:0 auto}
-    .control-panel{grid-template-columns: repeat(2, 1fr)}
-  }
-
-  /* Gamepad panel */
+  .ladder-line{position:absolute;left:50%;width:60px;height:2px;background:#fff;opacity:.95;border-radius:1px}
+  .ladder-line .text{position:absolute;top:-10px;left:-40px;font-size:10px;background:rgba(0,0,0,.4);padding:0 3px;border-radius:4px}
+  @media (max-width: 980px){ .container{grid-template-columns:1fr} .telemetry{grid-template-columns: 1fr} .horizon{margin:0 auto} .control-panel{grid-template-columns: repeat(2, 1fr)} }
   .gamepad-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;text-align:left;font-size:14px}
   .muted{opacity:.75}
 </style>
@@ -466,6 +58,7 @@ trevor@raspberrypi:~/marine_dive/templates $ cat index.html
 
     <div class="card">
       <h2>Телеметрия</h2>
+      <!-- оставлено без изменений -->
       <div class="telemetry">
         <div class="telemetry-grid">
           <div class="telemetry-item"><div class="label">Глубина</div><div class="value" id="depth-value">0.0 м</div></div>
@@ -476,24 +69,16 @@ trevor@raspberrypi:~/marine_dive/templates $ cat index.html
           <div class="telemetry-item"><div class="label">IMU</div><div class="value" id="imuStatus">—</div></div>
         </div>
         <div>
+          <!-- авиагоризонт — как раньше -->
           <div class="horizon" aria-label="Авиагоризонт">
-            <div id="sphere" class="sphere">
-              <div id="pitchLadder" class="pitch-ladder"></div>
-            </div>
-            <div id="compass" class="compass">
-              <div id="rollScale" class="roll-scale"></div>
-            </div>
-            <div class="bezel"></div>
-            <div class="roll-pointer"></div>
-            <div class="center-line"></div>
+            <div id="sphere" class="sphere"><div id="pitchLadder" class="pitch-ladder"></div></div>
+            <div id="compass" class="compass"><div id="rollScale" class="roll-scale"></div></div>
+            <div class="bezel"></div><div class="roll-pointer"></div><div class="center-line"></div>
           </div>
           <div style="text-align:center;opacity:.9;margin-top:8px">
-            Roll: <span id="rollVal">0.0</span>° &nbsp; | &nbsp;
-            Pitch: <span id="pitchVal">0.0</span>°
+            Roll: <span id="rollVal">0.0</span>° &nbsp; | &nbsp; Pitch: <span id="pitchVal">0.0</span>°
           </div>
-          <div style="text-align:center;margin-top:8px">
-            <button id="zeroBtn" class="button" type="button">Обнулить горизонт</button>
-          </div>
+          <div style="text-align:center;margin-top:8px"><button id="zeroBtn" class="button" type="button">Обнулить горизонт</button></div>
         </div>
       </div>
     </div>
@@ -506,42 +91,52 @@ trevor@raspberrypi:~/marine_dive/templates $ cat index.html
           <input type="range" min="-255" max="255" value="0" class="slider" id="motor-slider" oninput="updateMotor(this.value)">
           <div class="value-display">Мощность: <span id="motor-value">0</span></div>
         </div>
+
         <div class="control-group">
           <h3>Помпа 1</h3>
           <input type="range" min="-255" max="255" value="0" class="slider" id="pump1-slider" oninput="updatePump1(this.value)">
           <div class="value-display">Мощность: <span id="pump1-value">0</span></div>
         </div>
+
         <div class="control-group">
           <h3>Помпа 2</h3>
           <input type="range" min="-255" max="255" value="0" class="slider" id="pump2-slider" oninput="updatePump2(this.value)">
           <div class="value-display">Мощность: <span id="pump2-value">0</span></div>
         </div>
+
         <div class="control-group">
           <h3>Освещение</h3>
           <button class="button" id="btnLight" type="button" onclick="toggleLight()">Свет: <span id="light-status">OFF</span></button>
         </div>
 
-        <!-- Геймпад -->
+        <!-- новые -->
+        <div class="control-group">
+          <h3>Помпа 3</h3>
+          <input type="range" min="-255" max="255" value="0" class="slider" id="pump3-slider" oninput="updatePump3(this.value)">
+          <div class="value-display">Мощность: <span id="pump3-value">0</span></div>
+        </div>
+
+        <div class="control-group">
+          <h3>Помпа 4</h3>
+          <input type="range" min="-255" max="255" value="0" class="slider" id="pump4-slider" oninput="updatePump4(this.value)">
+          <div class="value-display">Мощность: <span id="pump4-value">0</span></div>
+        </div>
+
+        <!-- Геймпад (как было) -->
         <div class="control-group" style="grid-column:1/-1">
           <h3>Геймпад</h3>
           <div class="gamepad-grid">
             <div>
               <div>Состояние: <span id="gp-state" class="muted">не подключен</span></div>
               <div class="muted" id="gp-name"></div>
-              <div style="margin-top:8px">
-                <label><input type="checkbox" id="gp-enable"> Включить управление геймпадом</label>
-              </div>
-              <div style="margin-top:8px">
-                <label>Мёртвая зона: <input id="gp-deadzone" type="range" min="0" max="0.3" step="0.01" value="0.08" style="width:160px"></label>
-              </div>
+              <div style="margin-top:8px"><label><input type="checkbox" id="gp-enable"> Включить управление геймпадом</label></div>
+              <div style="margin-top:8px"><label>Мёртвая зона: <input id="gp-deadzone" type="range" min="0" max="0.3" step="0.01" value="0.08" style="width:160px"></label></div>
             </div>
             <div class="muted">
               <b>Раскладка (по умолчанию):</b><br/>
-              LS (левый стик) ↑/↓ — тяга (M)<br/>
-              LS ←/→ — руль (R)<br/>
-              RS ↑/↓ — помпа 2 (P2)<br/>
-              LT / RT — помпа 1 (P1) впуск/выпуск<br/>
-              A (Cross) — свет вкл/выкл
+              LS ↑/↓ — тяга (M); LS ←/→ — руль (R)<br/>
+              RS ↑/↓ — помпа 2 (P2); LT/RT — помпа 1 (P1)<br/>
+              A — свет. (P3/P4 слайдерами)
             </div>
           </div>
         </div>
@@ -552,238 +147,69 @@ trevor@raspberrypi:~/marine_dive/templates $ cat index.html
 <script>
 /* ===== Управление (слайдеры/кнопка) ===== */
 let lightState=false;
-
 function sendControl(payload){
-  return fetch('/control',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(payload)
-  }).catch(()=>{});
+  return fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).catch(()=>{});
 }
-
-function updateMotor(value){
-  const v=parseInt(value);
-  document.getElementById('motor-value').textContent=v;
-  sendControl({M:v});
-}
-function updatePump1(value){
-  const v=parseInt(value);
-  document.getElementById('pump1-value').textContent=v;
-  sendControl({P1:v});
-}
-function updatePump2(value){
-  const v=parseInt(value);
-  document.getElementById('pump2-value').textContent=v;
-  sendControl({P2:v});
-}
+function updateMotor(v){ v=parseInt(v); document.getElementById('motor-value').textContent=v; sendControl({M:v}); }
+function updatePump1(v){ v=parseInt(v); document.getElementById('pump1-value').textContent=v; sendControl({P1:v}); }
+function updatePump2(v){ v=parseInt(v); document.getElementById('pump2-value').textContent=v; sendControl({P2:v}); }
+function updatePump3(v){ v=parseInt(v); document.getElementById('pump3-value').textContent=v; sendControl({P3:v}); }
+function updatePump4(v){ v=parseInt(v); document.getElementById('pump4-value').textContent=v; sendControl({P4:v}); }
 function toggleLight(){
   lightState=!lightState;
   document.getElementById('light-status').textContent=lightState?'ON':'OFF';
   sendControl({L: lightState ? 1 : 0});
-  // синхронизируем lastSent.L (см. ниже), чтобы heartbeat включал L сразу
   lastSent.L = lightState ? 1 : 0;
 }
 
-/* ===== Телеметрия (цифры) ===== */
+/* ===== Телеметрия ===== */
 function updateTelemetry(){
-  fetch('/telemetry').then(r=>r.json()).then(data=>{
-    document.getElementById('depth-value').textContent   = data.depth.toFixed(1)+' м';
-    document.getElementById('temp-value').textContent    = data.temperature.toFixed(1)+' °C';
-    document.getElementById('voltage-value').textContent = data.voltage.toFixed(1)+' В';
-    document.getElementById('current-value').textContent = data.current.toFixed(1)+' А';
+  fetch('/telemetry').then(r=>r.json()).then(d=>{
+    document.getElementById('depth-value').textContent   = d.depth.toFixed(1)+' м';
+    document.getElementById('temp-value').textContent    = d.temperature.toFixed(1)+' °C';
+    document.getElementById('voltage-value').textContent = d.voltage.toFixed(1)+' В';
+    document.getElementById('current-value').textContent = d.current.toFixed(1)+' А';
   }).catch(()=>{});
 }
 setInterval(updateTelemetry,2000); updateTelemetry();
 
-/* ===== Авиагоризонт ===== */
-const PX_PER_DEG=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--px-per-deg'))||2.2;
-const SMOOTH=0.18;
+/* ===== Авиагоризонт (как было) ===== */
+const PX_PER_DEG=2.2, SMOOTH=0.18;
 let sRoll=0,sPitch=0,sYaw=0,zeroRoll=0,zeroPitch=0;
-const sphere=document.getElementById('sphere');
-const compass=document.getElementById('compass');
-const rollScale=document.getElementById('rollScale');
-const pitchLadder=document.getElementById('pitchLadder');
-const rollEl=document.getElementById('rollVal');
-const pitchEl=document.getElementById('pitchVal');
-const yawOut=document.getElementById('yaw-value');
-const imuStat=document.getElementById('imuStatus');
-const zeroBtn=document.getElementById('zeroBtn');
+const sphere=document.getElementById('sphere'), compass=document.getElementById('compass');
+const rollScale=document.getElementById('rollScale'), pitchLadder=document.getElementById('pitchLadder');
+const rollEl=document.getElementById('rollVal'), pitchEl=document.getElementById('pitchVal'), yawOut=document.getElementById('yaw-value');
+const imuStat=document.getElementById('imuStatus'), zeroBtn=document.getElementById('zeroBtn');
 zeroBtn.addEventListener('click',()=>{zeroRoll=sRoll;zeroPitch=sPitch;});
-
-(function renderRollScale(){
-  const size=parseFloat(getComputedStyle(rollScale).width);
-  const rTick=size/2-10; const rText=rTick+18;
-  for(let d=0; d<360; d+=10){
-    const isMajor=(d%30===0);
-    const tick=document.createElement('div');
-    tick.className='roll-tick'+(isMajor?'':' small');
-    tick.style.transform=`translate(-50%,-50%) rotate(${d}deg) translateY(${-rTick}px)`;
-    rollScale.appendChild(tick);
-    if(isMajor){
-      const lbl=document.createElement('div'); lbl.className='roll-label';
-      let text=d.toString(); if(d===0) text='N'; else if(d===90) text='E'; else if(d===180) text='S'; else if(d===270) text='W';
-      lbl.textContent=text;
-      lbl.style.transform=`translate(-50%,-50%) rotate(${d}deg) translateY(${-rText}px) rotate(${-d}deg)`;
-      rollScale.appendChild(lbl);
-    }
-  }
-})();
-(function renderPitchLadder(){
-  for(let d=-60; d<=60; d+=10){
-    if(d===0) continue;
-    const line=document.createElement('div');
-    line.className='ladder-line';
-    const y=-d*PX_PER_DEG;
-    line.style.top=`calc(50% + ${y}px)`;
-    const tL=document.createElement('span');
-    tL.className='text'; tL.textContent=Math.abs(d);
-    line.appendChild(tL); pitchLadder.appendChild(line);
-  }
-})();
+(function(){const size=parseFloat(getComputedStyle(rollScale).width);const rTick=size/2-10;const rText=rTick+18;for(let d=0;d<360;d+=10){const isMajor=(d%30===0);const t=document.createElement('div');t.className='roll-tick'+(isMajor?'':' small');t.style.transform=`translate(-50%,-50%) rotate(${d}deg) translateY(${-rTick}px)`;rollScale.appendChild(t);if(isMajor){const l=document.createElement('div');l.className='roll-label';let text=d.toString();if(d===0)text='N';else if(d===90)text='E';else if(d===180)text='S';else if(d===270)text='W';l.textContent=text;l.style.transform=`translate(-50%,-50%) rotate(${d}deg) translateY(${-rText}px) rotate(${-d}deg)`;rollScale.appendChild(l);}}})();
+(function(){for(let d=-60;d<=60;d+=10){if(d===0)continue;const line=document.createElement('div');line.className='ladder-line';const y=-d*PX_PER_DEG;line.style.top=`calc(50% + ${y}px)`;const tL=document.createElement('span');tL.className='text';tL.textContent=Math.abs(d);line.appendChild(tL);pitchLadder.appendChild(line);}})();
 function norm360(a){a=a%360;if(a<0)a+=360;return a;}
-function clamp(n,min,max){return Math.min(max,Math.max(min,n));}
-async function fetchIMU(){
-  try{
-    const r=await fetch('/imu',{cache:'no-store'}); if(!r.ok) throw new Error('HTTP '+r.status);
-    const data=await r.json();
-    const roll_raw=Number(data.pitch??0);
-    const pitch_raw=Number(data.roll??0);
-    const yaw_raw=Number(data.yaw??0);
-    const ts=Number(data.ts??0);
-    sRoll = sRoll+SMOOTH*(roll_raw-sRoll);
-    sPitch= sPitch+SMOOTH*(pitch_raw-sPitch);
-    sYaw  = sYaw+SMOOTH*(yaw_raw-sYaw);
-    const dispRoll=sRoll-zeroRoll;
-    const dispPitch=sPitch-zeroPitch;
-    const translateY=clamp(dispPitch,-60,60)*PX_PER_DEG;
-    const rotateDeg=-dispRoll;
-    sphere.style.transform=`translateY(${translateY}px) rotate(${rotateDeg}deg)`;
-    const yawDeg=norm360(sYaw);
-    compass.style.transform=`rotate(${yawDeg}deg)`;
-    rollEl.textContent=dispRoll.toFixed(1);
-    pitchEl.textContent=dispPitch.toFixed(1);
-    yawOut.textContent=yawDeg.toFixed(1)+'°';
-    const fresh=(Date.now()/1000-ts)<1.0;
-    imuStat.textContent=fresh?'OK':'STALE';
-    imuStat.style.color=fresh?'#7CFF7C':'#FFD46A';
-  }catch(e){
-    imuStat.textContent='NO DATA';
-    imuStat.style.color='#FFD46A';
-  }
-}
+async function fetchIMU(){try{const r=await fetch('/imu',{cache:'no-store'});if(!r.ok)throw 0;const d=await r.json();const rr=Number(d.pitch||0), pr=Number(d.roll||0), yr=Number(d.yaw||0), ts=Number(d.ts||0);sRoll=sRoll+SMOOTH*(rr-sRoll);sPitch=sPitch+SMOOTH*(pr-sPitch);sYaw=sYaw+SMOOTH*(yr-sYaw);const dispR=sRoll-zeroRoll, dispP=sPitch-zeroPitch;const trY=Math.max(-60,Math.min(60,dispP))*PX_PER_DEG; sphere.style.transform=`translateY(${trY}px) rotate(${-dispR}deg)`; const yaw=norm360(sYaw); compass.style.transform=`rotate(${yaw}deg)`; rollEl.textContent=dispR.toFixed(1); pitchEl.textContent=dispP.toFixed(1); yawOut.textContent=yaw.toFixed(1)+'°'; const fresh=(Date.now()/1000-ts)<1.0; imuStat.textContent=fresh?'OK':'STALE'; imuStat.style.color=fresh?'#7CFF7C':'#FFD46A';}catch(e){imuStat.textContent='NO DATA';imuStat.style.color='#FFD46A';}}
 setInterval(fetchIMU,50); fetchIMU();
 
-/* ===== Gamepad control ===== */
-const gpStateEl = document.getElementById('gp-state');
-const gpNameEl  = document.getElementById('gp-name');
-const gpEnable  = document.getElementById('gp-enable');
-const gpDeadzone= document.getElementById('gp-deadzone');
-
-let gpIndex = null;
-let gpLightLatched = false;
-let lastSent = {M:0,P1:0,P2:0,R:0,L:0};
-let lastSendTs = 0;
-const SEND_HZ = 20;                  // 20 Гц
-const HEARTBEAT_MS = 700;            // на случай фейл-сейфа ESC ~1200мс
-const INCLUDE_L_IN_HEARTBEAT = true; // всегда прикладывать L для явного статуса
-
-window.addEventListener('gamepadconnected', (e)=>{
-  gpIndex = e.gamepad.index;
-  gpStateEl.textContent = 'подключен';
-  gpNameEl.textContent = e.gamepad.id || '';
-});
-window.addEventListener('gamepaddisconnected', ()=>{
-  gpIndex = null;
-  gpStateEl.textContent = 'не подключен';
-  gpNameEl.textContent = '';
-});
-
-function applyDeadzoneExpo(v, dz, expo=0.2){
-  const s = Math.sign(v); v = Math.abs(v);
-  if (v < dz) return 0;
-  const t = (v - dz) / (1 - dz);     // [0..1]
-  const curved = t ** (1 + expo);    // мягкая середина
-  return s * curved;
-}
-function getPads(){
-  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
-  return pads || [];
-}
-function getTriggerValue(gp, axisIdx, btnIdx){
-  let v = 0;
-  if (gp.axes && gp.axes.length > axisIdx && gp.axes[axisIdx] != null){
-    v = (gp.axes[axisIdx] + 1) / 2; // [-1..1] -> [0..1]
-  } else if (gp.buttons && gp.buttons.length > btnIdx && gp.buttons[btnIdx]){
-    v = gp.buttons[btnIdx].value || (gp.buttons[btnIdx].pressed ? 1 : 0);
-  }
-  return clamp(v, 0, 1);
-}
-function tick(){
-  const now = performance.now();
-  if (gpIndex!=null && gpEnable.checked){
-    const pads = getPads();
-    const gp = pads[gpIndex];
-    if (gp){
-      const dz = parseFloat(gpDeadzone.value || '0.08');
-
-      const axLX = applyDeadzoneExpo(gp.axes[0]||0, dz, 0.25);   // руль
-      const axLY = applyDeadzoneExpo(gp.axes[1]||0, dz, 0.15);   // тяга
-      const axRY = applyDeadzoneExpo(gp.axes[3]||0, dz, 0.20);   // помпа2
-
-      const lt = getTriggerValue(gp, 2, 6);  // LT
-      const rt = getTriggerValue(gp, 5, 7);  // RT
-
-      // Маппинг:
-      const M  = Math.round(clamp(-axLY, -1, 1) * 255);  // LS Y
-      const R  = Math.round(clamp(axLX,  -1, 1) * 100);  // LS X
-      const P2 = Math.round(clamp(-axRY, -1, 1) * 255);  // RS Y
-      const P1 = Math.round(clamp(rt - lt, -1, 1) * 255);// RT-LT
-
-      // Свет (A / Cross)
-      const aPressed = gp.buttons && gp.buttons[0] && gp.buttons[0].pressed;
-      if (aPressed && !gpLightLatched){
-        lightState = !lightState;
-        document.getElementById('light-status').textContent = lightState ? 'ON' : 'OFF';
-        // отдельный моментальный пак, чтобы свет переключился без ожидания
-        sendControl({L: lightState ? 1 : 0});
-        gpLightLatched = true;
-        lastSent.L = lightState ? 1 : 0; // синхронизация для heartbeat
-      } else if (!aPressed) {
-        gpLightLatched = false;
-      }
-
-      // Троттлинг/heartbeat
-      const changed = (Math.abs(M - lastSent.M) > 1) ||
-                      (Math.abs(P1 - lastSent.P1) > 1) ||
-                      (Math.abs(P2 - lastSent.P2) > 1) ||
-                      (Math.abs(R - lastSent.R) > 1);
-      const due = (now - lastSendTs) >= (1000 / SEND_HZ);
-      const hb  = (now - lastSendTs) >= HEARTBEAT_MS;
-
-      if ((changed && due) || hb){
-        const payload = { M, P1, P2, R };
-        // прикладываем L в heartbeat, чтобы было видно в /serial_log «L:»
-        if (INCLUDE_L_IN_HEARTBEAT || hb) {
-          payload.L = lightState ? 1 : 0;
-        }
-        sendControl(payload);
-        lastSent = {M,P1,P2,R,L: lightState ? 1:0};
-        lastSendTs = now;
-
-        // синхронизируем ползунки для наглядности
-        document.getElementById('motor-slider').value = M;
-        document.getElementById('motor-value').textContent = M;
-        document.getElementById('pump1-slider').value = P1;
-        document.getElementById('pump1-value').textContent = P1;
-        document.getElementById('pump2-slider').value = P2;
-        document.getElementById('pump2-value').textContent = P2;
-      }
-    }
-  }
-  requestAnimationFrame(tick);
-}
-gpStateEl.textContent = (getPads().some(p=>p)) ? 'подключен' : 'не подключен';
-requestAnimationFrame(tick);
+/* ===== Gamepad (P3/P4 не маппим — управляются слайдерами) ===== */
+const gpStateEl=document.getElementById('gp-state'), gpNameEl=document.getElementById('gp-name');
+const gpEnable=document.getElementById('gp-enable'), gpDeadzone=document.getElementById('gp-deadzone');
+let gpIndex=null, gpLightLatched=false, lastSent={M:0,P1:0,P2:0,P3:0,P4:0,R:0,L:0}, lastSendTs=0;
+const SEND_HZ=20, HEARTBEAT_MS=700, INCLUDE_L_IN_HEARTBEAT=true;
+window.addEventListener('gamepadconnected',e=>{gpIndex=e.gamepad.index;gpStateEl.textContent='подключен';gpNameEl.textContent=e.gamepad.id||'';});
+window.addEventListener('gamepaddisconnected',()=>{gpIndex=null;gpStateEl.textContent='не подключен';gpNameEl.textContent='';});
+function clamp(n,min,max){return Math.min(max,Math.max(min,n));}
+function applyDeadzoneExpo(v,dz,expo=0.2){const s=Math.sign(v);v=Math.abs(v);if(v<dz)return 0;const t=(v-dz)/(1-dz);return s*t**(1+expo);}
+function getPads(){const p=navigator.getGamepads?navigator.getGamepads():[];return p||[];}
+function getTriggerValue(gp,axisIdx,btnIdx){let v=0;if(gp.axes&&gp.axes.length>axisIdx&&gp.axes[axisIdx]!=null){v=(gp.axes[axisIdx]+1)/2;}else if(gp.buttons&&gp.buttons.length>btnIdx&&gp.buttons[btnIdx]){v=gp.buttons[btnIdx].value||(gp.buttons[btnIdx].pressed?1:0);}return clamp(v,0,1);}
+function tick(){const now=performance.now(); if(gpIndex!=null && gpEnable.checked){const pads=getPads();const gp=pads[gpIndex]; if(gp){const dz=parseFloat(gpDeadzone.value||'0.08'); const axLX=applyDeadzoneExpo(gp.axes[0]||0,dz,0.25); const axLY=applyDeadzoneExpo(gp.axes[1]||0,dz,0.15); const axRY=applyDeadzoneExpo(gp.axes[3]||0,dz,0.20); const lt=getTriggerValue(gp,2,6), rt=getTriggerValue(gp,5,7);
+  const M=Math.round(clamp(-axLY,-1,1)*255), R=Math.round(clamp(axLX,-1,1)*100), P2=Math.round(clamp(-axRY,-1,1)*255), P1=Math.round(clamp(rt-lt,-1,1)*255);
+  const aPressed=gp.buttons&&gp.buttons[0]&&gp.buttons[0].pressed;
+  if(aPressed&&!gpLightLatched){lightState=!lightState;document.getElementById('light-status').textContent=lightState?'ON':'OFF';sendControl({L: lightState?1:0});gpLightLatched=true;lastSent.L=lightState?1:0;} else if(!aPressed){gpLightLatched=false;}
+  const changed=(Math.abs(M-lastSent.M)>1)||(Math.abs(P1-lastSent.P1)>1)||(Math.abs(P2-lastSent.P2)>1)||(Math.abs(R-lastSent.R)>1);
+  const due=(now-lastSendTs)>=(1000/SEND_HZ), hb=(now-lastSendTs)>=HEARTBEAT_MS;
+  if((changed&&due)||hb){const payload={M,P1,P2,R}; if(INCLUDE_L_IN_HEARTBEAT||hb) payload.L=lightState?1:0; sendControl(payload); lastSent={...lastSent,M,P1,P2,R,L:lightState?1:0}; lastSendTs=now;
+    document.getElementById('motor-slider').value=M;document.getElementById('motor-value').textContent=M;
+    document.getElementById('pump1-slider').value=P1;document.getElementById('pump1-value').textContent=P1;
+    document.getElementById('pump2-slider').value=P2;document.getElementById('pump2-value').textContent=P2;
+  }}} requestAnimationFrame(tick);}
+gpStateEl.textContent=(getPads().some(p=>p))?'подключен':'не подключен'; requestAnimationFrame(tick);
 </script>
 </body>
 </html>
