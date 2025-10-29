@@ -15,16 +15,16 @@ const int P1_A_PIN = 16;   // помпа1 A-input (PWM)
 const int P1_B_PIN = 4;    // помпа1 B-input (PWM)
 
 // Помпа 2
-const int P2_A_PIN = 17;   // помпа2 A-input (PWM)
-const int P2_B_PIN = 5;    // помпа2 B-input (PWM)
+const int P4_A_PIN = 17;   // помпа2 A-input (PWM)
+const int P4_B_PIN = 5;    // помпа2 B-input (PWM)
 
 // Помпа 3 (НОВЫЕ ПИНЫ)
 const int P3_A_PIN = 32;   // помпа3 A-input (PWM)
 const int P3_B_PIN = 33;   // помпа3 B-input (PWM)
 
 // Помпа 4 (НОВЫЕ ПИНЫ)
-const int P4_A_PIN = 25;   // помпа4 A-input (PWM)
-const int P4_B_PIN = 26;   // помпа4 B-input (PWM)
+const int P2_A_PIN = 25;   // помпа4 A-input (PWM)
+const int P2_B_PIN = 26;   // помпа4 B-input (PWM)
 
 // ESC и свет
 const int MOTOR_PIN = 14;  // ESC signal (Servo)
